@@ -8,7 +8,7 @@ import numpy as np
 
 from ..ik.sampler_space import sample_ik_solutions, save_ik_json
 from ..ik.robust_sampler import sample_ik_solutions_multi_pass
-from ..planning.search import global_optimal_path_dp, greedy_path
+from ..planning.search import global_optimal_prefix_dp, greedy_path
 from ..planning.time_metric import SegmentTimeModel, TotgSettings
 from ..types import IKSolution, TargetPoint
 from ..utils.reporting import write_robot_info_txt, write_summary_json, write_targets_json
@@ -34,11 +34,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--p0", type=str, default="", help="Start joint positions, e.g. '0,-0.7,0,-2.3,0,1.6,0.8'. Empty -> named-start.")
 
     # experiment setting
-    p.add_argument("--num-points", type=int, default=3, help="Number of target points n in [2,9].")
+    p.add_argument("--num-points", type=int, default=3, help="Number of target points n (max: 30).")
     p.add_argument("--seed", type=int, default=7, help="Random seed for target sampling & IK sampling.")
 
     # IK sampling (per point)
-    p.add_argument("--num-solutions", type=int, default=200, help="IK solutions per target point (default: 200).")
+    p.add_argument(
+        "--num-solutions",
+        type=int,
+        default=200,
+        help="IK solutions per target point m (max: 3000).",
+    )
     p.add_argument("--num-spaces", type=int, default=20, help="Yaw spaces (default: 20).")
     p.add_argument("--max-attempts", type=int, default=20000, help="Max IK attempts per point (default: 20000).")
     p.add_argument("--ik-timeout", type=float, default=0.05, help="IK timeout per attempt (s).")
@@ -51,7 +56,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--time-model",
         type=str,
-        default="auto",
+        default="trapezoid",
         choices=["auto", "totg", "trapezoid"],
         help="Segment time model: auto=prefer MoveIt TOTG, fallback to trapezoid; "
         "totg=force MoveIt TOTG; trapezoid=analytic rest-to-rest model.",
@@ -107,10 +112,10 @@ def main() -> None:
     args = _parse_args()
 
     n = int(args.num_points)
-    if n < 2:
-        n = 2
-    if n > 20:
-        n = 20
+    if n < 1:
+        n = 1
+    if n > 30:
+        n = 30
 
     data_paths = prepare_data_paths(args.data_root)
     print(f"[run] timestamp = {data_paths.timestamp}")
@@ -162,6 +167,10 @@ def main() -> None:
         )
 
         requested = int(args.num_solutions)
+        if requested < 1:
+            requested = 1
+        if requested > 3000:
+            requested = 3000
         resample_max = int(args.resample_max)
         topup_passes = int(args.topup_passes)
         precheck_attempts = int(args.precheck_attempts)
@@ -268,16 +277,15 @@ def main() -> None:
                     f"or reducing --num-points."
                 )
 
-            # Accept the best candidate (maybe with <200 solutions)
+            # Strict: the spec requires finding exactly m solutions for each point.
             if best_found < requested:
-                best_payload["meta"].update(
-                    {
-                        "accepted_with_shortfall": True,
-                        "shortfall": int(requested - best_found),
-                    }
+                raise RuntimeError(
+                    f"p{i}: only found {best_found}/{requested} unique IK solutions after "
+                    f"{resample_max} trials (best candidate). Consider increasing --max-attempts, "
+                    f"--ik-timeout, --topup-passes, relaxing --uniq-resolution, or shrinking --num-solutions."
                 )
-            else:
-                best_payload["meta"].update({"accepted_with_shortfall": False, "shortfall": 0})
+
+            best_payload["meta"].update({"accepted_with_shortfall": False, "shortfall": 0})
 
             targets.append(best_target)
             solutions_by_point.append(list(best_payload["solutions_obj"]))
@@ -320,45 +328,161 @@ def main() -> None:
             )
 
 
-        # 6) Traditional greedy
-        print("\n[search] greedy baseline ...")
+        # 6) Greedy (local) and DP prefix-optimal (global / enumeration-equivalent)
+        # Keep the time model consistent across both strategies.
+        print("\n[search] greedy (local) ...")
+        time_model = _make_time_model()
         greedy_res = greedy_path(
             start_q=start_q,
             solutions_by_point=solutions_by_point,
             requested_per_point=requested,
-            time_model=_make_time_model(),
+            time_model=time_model,
         )
-        write_summary_json(
-            data_paths.summary_traditional_json,
-            title="Greedy baseline (traditional, segment-wise optimal)",
-            targets=targets,
-            start_label=start_label,
-            start_q=start_q,
-            result=greedy_res,
-            ik_metas=ik_meta_by_point,
-            timestamp=data_paths.timestamp,
-        )
-        print(f"[search] greedy summary -> {data_paths.summary_traditional_json.name}")
 
-        # 7) Global optimum (DP, enumeration-equivalent)
-        print("\n[search] global optimal (DP, enumeration-equivalent) ...")
-        dp_res = global_optimal_path_dp(
+        greedy_seg = [float(seg.best_time_s) for seg in greedy_res.segments]
+        # JSON needs plain Python numbers, not numpy scalars
+        greedy_cum = [float(v) for v in np.cumsum(np.asarray(greedy_seg, dtype=float))]
+
+        print("\n[search] global DP prefix-optimal (enumeration-equivalent) ...")
+        dp_res, dp_prefix = global_optimal_prefix_dp(
             start_q=start_q,
             solutions_by_point=solutions_by_point,
             requested_per_point=requested,
-            time_model=_make_time_model(),
+            time_model=time_model,
         )
-        write_summary_json(
-            data_paths.summary_enumeration_json,
-            title="Global optimum (DP; equivalent to exhaustive enumeration of all IK combinations)",
-            targets=targets,
-            start_label=start_label,
-            start_q=start_q,
-            result=dp_res,
-            ik_metas=ik_meta_by_point,
-            timestamp=data_paths.timestamp,
-        )
-        print(f"[search] global summary -> {data_paths.summary_enumeration_json.name}")
+
+        # Build global prefix paths (solutions + segment times) for s1..s_n
+        global_prefix_paths = []
+        s_times = []
+        for pr in dp_prefix:
+            i1 = int(pr.to_point_index_1based)
+            idxs = list(pr.solution_indices_0based)
+
+            # Gather solutions along the best path to p_i
+            sols = [solutions_by_point[k][int(idxs[k])] for k in range(i1)]
+
+            seg_times = []
+            cur_q = list(start_q)
+            for sol in sols:
+                dt = float(time_model.segment_time_s(cur_q, sol.joint_positions))
+                seg_times.append(dt)
+                cur_q = list(sol.joint_positions)
+
+            s_i = float(pr.best_time_s)
+            s_times.append(s_i)
+
+            global_prefix_paths.append(
+                {
+                    "to": f"p{i1}",
+                    "cumulative_time_s": s_i,
+                    "segment_times_s": seg_times,
+                    "path": [
+                        {
+                            "point": f"p{k+1}",
+                            "solution_index_0based": int(sol.index),
+                            "solution_index_1based": int(sol.index) + 1,
+                            "solution_id": f"p{k+1}_{int(sol.index)+1}",
+                            "attempt": int(sol.attempt),
+                            "joint_positions": [float(v) for v in sol.joint_positions],
+                        }
+                        for k, sol in enumerate(sols)
+                    ],
+                }
+            )
+
+        # Optimization rate r_i = (t_i - s_i)/t_i
+        rates = []
+        for i in range(len(greedy_cum)):
+            t_i = float(greedy_cum[i])
+            s_i = float(s_times[i])
+            r_i = 0.0
+            if t_i > 1e-12:
+                r_i = float((t_i - s_i) / t_i)
+            rates.append({"point": f"p{i+1}", "t_i": t_i, "s_i": s_i, "r_i": r_i})
+
+        # Build unified summary.json
+        import json
+        summary = {
+            "format": "panda_ik_benchmark_summary",
+            "format_version": 2,
+            "meta": {
+                "timestamp": str(data_paths.timestamp),
+                "seed": int(args.seed),
+                "group": str(ctx.group),
+                "tip_link": str(ctx.tip_link),
+                "num_points": int(n),
+                "num_solutions": int(requested),
+                "time_model": {
+                    "requested": str(time_model.info.requested),
+                    "effective": str(time_model.info.effective),
+                    "totg_available": bool(time_model.info.totg_available),
+                    "totg_failures": int(time_model.info.totg_failures),
+                    "note": str(time_model.info.note),
+                },
+            },
+            "units": {"cartesian_position": "m", "joint_position": "rad", "time": "s"},
+            "start": {
+                "name": "p0",
+                "label": str(start_label),
+                "joint_positions": [float(v) for v in start_q],
+            },
+            "targets": [
+                {"name": f"p{i}", "x": float(p.x), "y": float(p.y), "z": float(p.z)}
+                for i, p in enumerate(targets, start=1)
+            ],
+            "ik_files": {f"p{i}": data_paths.ik_json_for_point(i).name for i in range(1, n + 1)},
+            "ik_sampling_meta": {
+                f"p{i}": dict(meta) for i, meta in enumerate(ik_meta_by_point, start=1)
+            },
+            "greedy": {
+                "segment_times_s": greedy_seg,
+                "cumulative_times_s": greedy_cum,
+                "steps": [
+                    {
+                        "point": f"p{i}",
+                        "segment_time_s": float(seg.best_time_s),
+                        "cumulative_time_s": float(greedy_cum[i - 1]),
+                        "solution": {
+                            "solution_index_0based": int(seg.best_solution.index),
+                            "solution_index_1based": int(seg.best_solution.index) + 1,
+                            "solution_id": f"p{i}_{int(seg.best_solution.index)+1}",
+                            "attempt": int(seg.best_solution.attempt),
+                            "joint_positions": [float(v) for v in seg.best_solution.joint_positions],
+                        },
+                    }
+                    for i, seg in enumerate(greedy_res.segments, start=1)
+                ],
+            },
+            "global": {
+                "cumulative_times_s": s_times,
+                "prefix_paths": global_prefix_paths,
+                "final_path": {
+                    "total_time_s": float(dp_res.total_time_s),
+                    "segments": [
+                        {
+                            "from": seg.from_label,
+                            "to": seg.to_label,
+                            "time_s": float(seg.best_time_s),
+                            "solution_index_0based": int(seg.best_solution.index),
+                            "solution_index_1based": int(seg.best_solution.index) + 1,
+                            "solution_id": f"p{seg.seg_idx_1based}_{int(seg.best_solution.index)+1}",
+                            "attempt": int(seg.best_solution.attempt),
+                            "joint_positions": [float(v) for v in seg.best_solution.joint_positions],
+                        }
+                        for seg in dp_res.segments
+                    ],
+                },
+            },
+            "optimization_rate": {
+                "formula": "(t_i - s_i) / t_i",
+                "values": rates,
+            },
+        }
+
+        with open(data_paths.summary_json, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False, sort_keys=True)
+
+        print(f"[search] summary -> {data_paths.summary_json.name}")
 
         print("\n[done] bye.")
     finally:

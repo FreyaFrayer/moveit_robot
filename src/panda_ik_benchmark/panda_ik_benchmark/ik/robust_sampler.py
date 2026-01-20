@@ -78,8 +78,9 @@ def sample_ik_solutions_multi_pass(
             break
 
         remaining = requested - len(merged_solutions)
-        # sampler_space has an internal clamp to [50, 500], so keep it explicit here.
-        per_pass_request = max(50, int(remaining))
+        # Request the remaining count for this pass. The underlying sampler enforces
+        # a hard cap (currently 3000) to keep runtime / output size bounded.
+        per_pass_request = max(1, int(remaining))
 
         seed_pass = int(seed) + int(pass_idx) * int(pass_seed_stride)
 

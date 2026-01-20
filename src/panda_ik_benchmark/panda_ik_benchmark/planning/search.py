@@ -30,6 +30,24 @@ class PathResult:
     time_model: TimeModelInfo
 
 
+@dataclass(frozen=True)
+class PrefixPathResult:
+    """Prefix-optimal result for reaching p_i (i>=1).
+
+    This is the DP equivalent of "exhaustive enumeration" for each prefix:
+      - s1 = min_{q in IK(p1)} time(p0->q)
+      - s2 = min_{q1 in IK(p1), q2 in IK(p2)} time(p0->q1) + time(q1->q2)
+      - ...
+
+    The best path is represented by the chosen IK solution indices (0-based)
+    for each waypoint p1..p_i.
+    """
+
+    to_point_index_1based: int
+    best_time_s: float
+    solution_indices_0based: Sequence[int]
+
+
 def greedy_path(
     *,
     start_q: Sequence[float],
@@ -108,8 +126,59 @@ def global_optimal_path_dp(
     Globally optimal path using dynamic programming (shortest path in a layered DAG).
 
     This is mathematically equivalent to enumerating all IK combinations, but avoids
-    the 200^n explicit explosion. Complexity is O(n * K^2) with K≈200.
+    the explicit exponential explosion.
     """
+    # Keep old API but implement through the prefix DP (s_n is the global optimum).
+    res, _prefix = global_optimal_prefix_dp(
+        start_q=start_q,
+        solutions_by_point=solutions_by_point,
+        requested_per_point=requested_per_point,
+        time_model=time_model,
+    )
+    return res
+
+
+def global_optimal_prefix_dp(
+    *,
+    start_q: Sequence[float],
+    solutions_by_point: Sequence[Sequence[IKSolution]],
+    requested_per_point: int,
+    time_model: SegmentTimeModel,
+    block_size: int = 128,
+) -> Tuple[PathResult, Sequence[PrefixPathResult]]:
+    """Prefix-optimal dynamic programming with optional blocking.
+
+    Returns
+    -------
+    (final_path_result, prefix_results)
+
+    - final_path_result corresponds to s_n (best path to p_n).
+    - prefix_results[i-1] corresponds to s_i (best path to p_i).
+
+    Notes
+    -----
+    - The DP graph is a layered DAG: each IK solution at p_i is a node.
+    - Edge costs are segment times between consecutive waypoints (rest-to-rest).
+    - Complexity is O(sum_i K_{i-1}*K_i). For K up to 3000, blocking keeps peak
+      memory manageable while remaining vectorized.
+    """
+
+    # Guardrail: MoveIt TOTG is extremely expensive per edge (it constructs a trajectory
+    # and runs time-parameterization). DP needs *many* edges, so TOTG quickly becomes
+    # intractable for large IK sets (e.g. 3000 solutions -> 9M edges per segment).
+    #
+    # For small problems users may still explicitly want TOTG, so only block it once
+    # the theoretical edge count exceeds a conservative threshold.
+    if str(time_model.info.effective) == "totg":
+        edge_est = 0
+        for li in range(1, len(solutions_by_point)):
+            edge_est += int(len(solutions_by_point[li - 1])) * int(len(solutions_by_point[li]))
+        if edge_est > 250_000:
+            raise RuntimeError(
+                "time_model=totg is too slow for DP at this scale "
+                f"(estimated edges={edge_est}). Use --time-model trapezoid (recommended)."
+            )
+
     q0 = np.asarray(start_q, dtype=float)
 
     layers = [list(layer) for layer in solutions_by_point]
@@ -119,44 +188,76 @@ def global_optimal_path_dp(
 
     # Convert to numpy arrays
     Q = [np.asarray([s.joint_positions for s in layer], dtype=float) for layer in layers]
-    K = [int(q.shape[0]) for q in Q]
     dof = int(Q[0].shape[1])
 
     # dp for layer 0 (p1): dp1[j] = cost(p0 -> p1_j)
     t0 = time_model.segment_time_matrix_s(q0.reshape((1, dof)), Q[0])  # (1, K1)
     dp = t0.reshape((-1,))
-    parents: List[np.ndarray] = [np.full((K[0],), -1, dtype=int)]
+    parents: List[np.ndarray] = [np.full((int(dp.shape[0]),), -1, dtype=int)]
 
-    # iterate layers
+    best_idx_per_layer: List[int] = [int(np.argmin(dp))]
+    best_time_per_layer: List[float] = [float(dp[best_idx_per_layer[0]])]
+
+    # iterate layers with blocking along the *current* layer to cap peak memory
+    block_size = max(1, int(block_size))
+
     for li in range(1, len(Q)):
         prev = Q[li - 1]  # (Kprev, dof)
         curr = Q[li]      # (Kcurr, dof)
+        Kprev = int(prev.shape[0])
+        Kcurr = int(curr.shape[0])
 
-        # cost matrix: (Kprev, Kcurr)
-        tmat = time_model.segment_time_matrix_s(prev, curr)
+        dp_new = np.empty((Kcurr,), dtype=float)
+        parent = np.empty((Kcurr,), dtype=int)
 
-        # dp_new[j] = min_k dp[k] + tmat[k, j]
-        totals = dp.reshape((-1, 1)) + tmat
-        parent = np.argmin(totals, axis=0).astype(int)     # (Kcurr,)
-        dp_new = totals[parent, np.arange(totals.shape[1])]  # (Kcurr,)
+        for j0 in range(0, Kcurr, block_size):
+            j1 = min(Kcurr, j0 + block_size)
+            curr_block = curr[j0:j1]
+
+            # cost matrix for the block: (Kprev, B)
+            tmat = time_model.segment_time_matrix_s(prev, curr_block)
+
+            # totals: (Kprev, B)
+            totals = dp.reshape((-1, 1)) + tmat
+            parent_block = np.argmin(totals, axis=0).astype(int)  # (B,)
+            # gather best costs per column
+            cols = np.arange(int(totals.shape[1]), dtype=int)
+            dp_block = totals[parent_block, cols]
+
+            dp_new[j0:j1] = dp_block
+            parent[j0:j1] = parent_block
 
         parents.append(parent)
         dp = dp_new
 
-    # choose best final solution
-    best_last = int(np.argmin(dp))
-    best_total = float(dp[best_last])
+        best_idx = int(np.argmin(dp))
+        best_idx_per_layer.append(best_idx)
+        best_time_per_layer.append(float(dp[best_idx]))
 
-    # backtrack indices
-    idxs = [0] * len(Q)
-    idxs[-1] = best_last
-    for li in range(len(Q) - 1, 0, -1):
-        idxs[li - 1] = int(parents[li][idxs[li]])
+    # Build prefix results (s1..s_n)
+    prefix_results: List[PrefixPathResult] = []
+    for li in range(len(Q)):
+        best_idx = int(best_idx_per_layer[li])
 
-    # build segments with chosen solutions
+        # backtrack indices for this prefix
+        idxs = [0] * (li + 1)
+        idxs[li] = best_idx
+        for k in range(li, 0, -1):
+            idxs[k - 1] = int(parents[k][idxs[k]])
+
+        prefix_results.append(
+            PrefixPathResult(
+                to_point_index_1based=int(li + 1),
+                best_time_s=float(best_time_per_layer[li]),
+                solution_indices_0based=tuple(int(x) for x in idxs),
+            )
+        )
+
+    # Build PathResult for the final layer (s_n)
+    final_idxs = list(prefix_results[-1].solution_indices_0based)
     segments: List[SegmentResult] = []
     current_q = q0.copy()
-    for i, (layer, chosen_idx) in enumerate(zip(layers, idxs), start=1):
+    for i, (layer, chosen_idx) in enumerate(zip(layers, final_idxs), start=1):
         sol = layer[int(chosen_idx)]
         t = time_model.segment_time_s(current_q, sol.joint_positions)
         segments.append(
@@ -185,10 +286,12 @@ def global_optimal_path_dp(
         totg_failures=int(tm.totg_failures),
     )
 
-    return PathResult(
+    res = PathResult(
         method="dp_global_optimal",
         segments=segments,
-        total_time_s=float(best_total),
+        total_time_s=float(prefix_results[-1].best_time_s),
         total_paths_theoretical=int(total_paths),
         time_model=tm_copy,
     )
+
+    return res, tuple(prefix_results)

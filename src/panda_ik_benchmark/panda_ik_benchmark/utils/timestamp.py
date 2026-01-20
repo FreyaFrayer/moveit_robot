@@ -47,6 +47,11 @@ class DataPaths:
     def summary_enumeration_json(self) -> Path:
         return self.run_dir / "summary_enumeration.json"
 
+    @property
+    def summary_json(self) -> Path:
+        """Unified summary required by the benchmark spec."""
+        return self.run_dir / "summary.json"
+
     # Backward-compatible aliases (deprecated): keep the old property names but point to JSON.
     @property
     def summary_traditional_txt(self) -> Path:  # pragma: no cover

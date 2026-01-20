@@ -225,8 +225,10 @@ def sample_ik_solutions(
     """
     rng = DeterministicRNG(int(seed))
 
+    # NOTE: This benchmark supports up to 3000 IK solutions per point.
+    # Keep a hard cap to prevent accidental huge JSON / memory blowups.
     num_solutions = int(num_solutions)
-    num_solutions = max(50, min(500, num_solutions))
+    num_solutions = max(1, min(3000, num_solutions))
 
     num_spaces = int(num_spaces)
     num_spaces = max(1, min(num_solutions, num_spaces))
